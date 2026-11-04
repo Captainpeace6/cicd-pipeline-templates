@@ -1,0 +1,135 @@
+name: container (reusable)
+
+# Reusable workflow: build -> scan -> smoke test -> push -> sign.
+# Any repo can call it with `uses: Captainpeace6/cicd-pipeline-templates/.github/workflows/_container.yml@main`.
+
+on:
+  workflow_call:
+    inputs:
+      image-name:
+        description: Image name without registry, e.g. owner/app
+        type: string
+        required: true
+      push:
+        description: Push and sign the image
+        type: boolean
+        default: false
+      health-path:
+        description: Path the smoke test must get a 200 from
+        type: string
+        default: /healthz
+      port:
+        type: number
+        default: 8000
+    outputs:
+      digest:
+        description: Pushed image digest (empty when push is false)
+        value: ${{ jobs.image.outputs.digest }}
+
+permissions:
+  contents: read
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write          # push to GHCR
+      id-token: write          # keyless cosign signing
+      security-events: write   # upload Trivy SARIF
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    env:
+      IMAGE: ghcr.io/${{ inputs.image-name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: ${{ env.IMAGE }}:${{ github.sha }}
+          build-args: |
+            APP_VERSION=${{ github.ref_name }}
+            GIT_SHA=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Scan image (fail on fixable HIGH/CRITICAL)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.IMAGE }}:${{ github.sha }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+          format: table
+
+      - name: Scan report for the Security tab
+        if: always()
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.IMAGE }}:${{ github.sha }}
+          format: sarif
+          output: trivy.sarif
+          skip-setup-trivy: true
+
+      - name: Upload SARIF
+        if: always() && hashFiles('trivy.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy.sarif
+          category: trivy-image
+
+      - name: Smoke test the container
+        run: |
+          docker run -d --name smoke -p ${{ inputs.port }}:${{ inputs.port }} "$IMAGE:${{ github.sha }}"
+          for i in $(seq 1 30); do
+            if curl -sf "http://127.0.0.1:${{ inputs.port }}${{ inputs.health-path }}"; then
+              echo; echo "healthy after ${i}s"; exit 0
+            fi
+            sleep 1
+          done
+          docker logs smoke
+          exit 1
+
+      - name: SBOM (CycloneDX)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.IMAGE }}:${{ github.sha }}
+          format: cyclonedx
+          output: sbom.cdx.json
+          skip-setup-trivy: true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom.cdx.json
+
+      - name: Log in to GHCR
+        if: inputs.push
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push
+        id: push
+        if: inputs.push
+        run: |
+          docker tag "$IMAGE:${{ github.sha }}" "$IMAGE:latest"
+          docker push "$IMAGE:${{ github.sha }}"
+          docker push "$IMAGE:latest"
+          digest=$(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE:${{ github.sha }}" | cut -d@ -f2)
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "Pushed $IMAGE@$digest" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: sigstore/cosign-installer@v3
+        if: inputs.push
+
+      - name: Sign image (keyless, GitHub OIDC)
+        if: inputs.push
+        run: cosign sign --yes "$IMAGE@${{ steps.push.outputs.digest }}"

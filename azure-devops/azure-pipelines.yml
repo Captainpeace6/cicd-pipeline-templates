@@ -1,0 +1,22 @@
+# Thin pipeline that composes the shared templates.
+trigger:
+  branches:
+    include: [main]
+
+pr:
+  branches:
+    include: [main]
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+  - template: templates/python-ci.yml
+    parameters:
+      pythonVersion: "3.12"
+
+  - template: templates/container.yml
+    parameters:
+      imageRepository: captainpeace6/inventory-api
+      registryConnection: ghcr-connection
+      push: ${{ eq(variables['Build.SourceBranch'], 'refs/heads/main') }}

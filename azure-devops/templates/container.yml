@@ -1,0 +1,48 @@
+# Stage template: build, scan, smoke test and (on main) push a container image.
+parameters:
+  - name: registry
+    type: string
+    default: ghcr.io
+  - name: imageRepository
+    type: string
+  - name: registryConnection
+    type: string
+  - name: push
+    type: boolean
+    default: false
+
+stages:
+  - stage: Container
+    dependsOn: Test
+    jobs:
+      - job: image
+        variables:
+          tag: $(Build.SourceVersion)
+          image: ${{ parameters.registry }}/${{ parameters.imageRepository }}
+        steps:
+          - script: |
+              docker build \
+                --build-arg APP_VERSION=$(Build.SourceBranchName) \
+                --build-arg GIT_SHA=$(Build.SourceVersion) \
+                -t $(image):$(tag) .
+            displayName: Build
+          - script: |
+              curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+              trivy image --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 $(image):$(tag)
+            displayName: Trivy scan
+          - script: |
+              docker run -d --name smoke -p 8000:8000 $(image):$(tag)
+              for i in $(seq 1 30); do curl -sf http://127.0.0.1:8000/healthz && exit 0; sleep 1; done
+              docker logs smoke; exit 1
+            displayName: Smoke test
+          - ${{ if eq(parameters.push, true) }}:
+              - task: Docker@2
+                displayName: Log in to registry
+                inputs:
+                  command: login
+                  containerRegistry: ${{ parameters.registryConnection }}
+              - script: |
+                  docker tag $(image):$(tag) $(image):latest
+                  docker push $(image):$(tag)
+                  docker push $(image):latest
+                displayName: Push

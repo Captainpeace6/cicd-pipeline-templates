@@ -1,0 +1,27 @@
+# Stage template: lint + unit tests for a Python service.
+parameters:
+  - name: pythonVersion
+    type: string
+    default: "3.12"
+
+stages:
+  - stage: Test
+    jobs:
+      - job: lint_test
+        steps:
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: ${{ parameters.pythonVersion }}
+          - script: pip install -r requirements-dev.txt
+            displayName: Install deps
+          - script: ruff check . && ruff format --check .
+            displayName: Lint
+          - script: pytest --cov-report=xml --junitxml=junit.xml
+            displayName: Unit tests
+          - task: PublishTestResults@2
+            condition: always()
+            inputs:
+              testResultsFiles: junit.xml
+          - task: PublishCodeCoverageResults@2
+            inputs:
+              summaryFileLocation: coverage.xml

@@ -1,0 +1,90 @@
+// Declarative pipeline with the same stages as the GitHub Actions workflow.
+// Needs: Docker on the agent, credentials "ghcr" (username/token), Trivy installed.
+pipeline {
+  agent { label 'docker' }
+
+  options {
+    timestamps()
+    timeout(time: 30, unit: 'MINUTES')
+    buildDiscarder(logRotator(numToKeepStr: '20'))
+    disableConcurrentBuilds()
+  }
+
+  environment {
+    IMAGE = "ghcr.io/captainpeace6/inventory-api"
+    TAG   = "${env.GIT_COMMIT.take(12)}"
+  }
+
+  stages {
+    stage('Lint & test') {
+      parallel {
+        stage('Lint') {
+          agent { docker { image 'python:3.12-slim'; reuseNode true } }
+          steps {
+            sh 'pip install -q -r requirements-dev.txt && ruff check . && ruff format --check .'
+          }
+        }
+        stage('Unit tests') {
+          agent { docker { image 'python:3.12-slim'; reuseNode true } }
+          steps {
+            sh 'pip install -q -r requirements-dev.txt && pytest --cov-report=xml --junitxml=junit.xml'
+          }
+          post {
+            always { junit 'junit.xml' }
+          }
+        }
+      }
+    }
+
+    stage('Build image') {
+      steps {
+        sh """
+          docker build \
+            --build-arg APP_VERSION=${env.BRANCH_NAME} \
+            --build-arg GIT_SHA=${env.GIT_COMMIT} \
+            -t ${IMAGE}:${TAG} .
+        """
+      }
+    }
+
+    stage('Scan') {
+      steps {
+        sh "trivy image --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 ${IMAGE}:${TAG}"
+      }
+    }
+
+    stage('Smoke test') {
+      steps {
+        sh """
+          docker run -d --rm --name smoke-${BUILD_NUMBER} -p 18000:8000 ${IMAGE}:${TAG}
+          for i in \$(seq 1 30); do curl -sf http://127.0.0.1:18000/healthz && exit 0; sleep 1; done
+          docker logs smoke-${BUILD_NUMBER}; exit 1
+        """
+      }
+      post {
+        always { sh "docker rm -f smoke-${BUILD_NUMBER} || true" }
+      }
+    }
+
+    stage('Push') {
+      when { branch 'main' }
+      steps {
+        withCredentials([usernamePassword(credentialsId: 'ghcr', usernameVariable: 'GH_USER', passwordVariable: 'GH_TOKEN')]) {
+          sh '''
+            echo "$GH_TOKEN" | docker login ghcr.io -u "$GH_USER" --password-stdin
+            docker tag $IMAGE:$TAG $IMAGE:latest
+            docker push $IMAGE:$TAG
+            docker push $IMAGE:latest
+          '''
+        }
+      }
+    }
+  }
+
+  post {
+    always {
+      sh "docker image rm ${IMAGE}:${TAG} || true"
+      sh 'docker logout ghcr.io || true'
+    }
+  }
+}
